@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from sklearn.metrics.pairwise import cosine_similarity
 
+# sentence-transformers kütüphanesi opsiyonel olarak kontrol ediliyor
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError as e:
@@ -15,6 +16,9 @@ except ImportError as e:
 
 
 def load_catalog(json_path: str) -> List[Dict[str, Any]]:
+    """
+    JSON dosyasından ürün/içerik kataloğunu yükler.
+    """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
@@ -24,20 +28,25 @@ def load_catalog(json_path: str) -> List[Dict[str, Any]]:
     raise ValueError("Unsupported JSON structure. Expected a list or an object with key 'items' being a list.")
 
 
-
-
 def generate_embeddings(
     catalog: List[Dict[str, Any]],
+    json_path: str,  # Dinamik cache yolu için dosya yolu eklendi
     model_name: str = "sentence-transformers/paraphrase-MPNet-base-v2",
 ) -> Tuple[Dict[str, NDArray[np.float32]], Dict[str, Dict[str, Any]]]:
+    """
+    Katalogdaki her bir öğe için metin embedding'leri oluşturur.
+    """
     if SentenceTransformer is None:
         raise ImportError("sentence-transformers is not installed. Please install it before running.")
 
     model = SentenceTransformer(model_name)
+    #Modelin embedding boyutu dinamik olarak alındı.
+    embedding_dim = model.get_sentence_embedding_dimension()
 
     title_weight = 0.3
     genre_weight = 0.7
-    cache_path = "embeddings_cache.npz"
+    # Önbellek dosya adı artık girdi dosyasının adına göre dinamik olarak oluşturuluyor.
+    cache_path = os.path.splitext(json_path)[0] + "_embedding_cache.npz"
 
     id_to_item: Dict[str, Dict[str, Any]] = {}
 
@@ -132,7 +141,8 @@ def generate_embeddings(
     for i, item_id in enumerate(ids):
         vec = reused_vectors.get(i) if i in reused_vectors else new_vectors.get(i)
         if vec is None:
-            vec = np.zeros((384,), dtype=np.float32)
+            # : Hard-coded 384 boyutu yerine modelden alınan dinamik boyut kullanıldı.
+            vec = np.zeros((embedding_dim,), dtype=np.float32)
         embeddings[item_id] = vec
         final_matrix.append(vec)
 
@@ -151,10 +161,13 @@ def generate_embeddings(
 
 def get_embedding_based_recommendations(
     seed_id: str,
-    catalog: List[Dict[str, Any]],
+    id_to_item: Dict[str, Dict[str, Any]],  # : Performans için tam katalog yerine id_to_item map'i kullanılıyor
     embeddings: Dict[str, NDArray[np.float32]],
     k: int = 10,
 ) -> List[Dict[str, Any]]:
+    """
+    Verilen bir 'seed' öğeye en çok benzeyen öğeleri bulur.
+    """
     if seed_id not in embeddings:
         raise ValueError(f"seed_id '{seed_id}' not found in embeddings.")
 
@@ -170,16 +183,16 @@ def get_embedding_based_recommendations(
     order = np.argsort(-sims)
     top_indices = order[: min(k, len(ids))]
 
-    id_to_title: Dict[str, str] = {}
-    id_to_genres: Dict[str, List[str]] = {}
-    for it in catalog:
-        iid = str(it.get("Id") or it.get("id") or it.get("ID") or "")
-        if not iid:
-            continue
-        title = str(it.get("Title") or it.get("title") or "")
-        genres_val = it.get("Genres")
+    # : Tüm kataloğu tekrar taramak yerine, id_to_item map'inden veriler verimli bir şekilde çekiliyor.
+    results: List[Dict[str, Any]] = []
+    for idx in top_indices:
+        iid = ids[idx]
+        item_data = id_to_item.get(iid, {})
+        title = str(item_data.get("Title") or item_data.get("title") or "")
+        
+        genres_val = item_data.get("Genres")
+        genres_list: List[str] = []
         if isinstance(genres_val, list):
-            genres_list: List[str] = []
             for g in genres_val:
                 if isinstance(g, dict) and "Name" in g and g["Name"] is not None:
                     genres_list.append(str(g["Name"]))
@@ -189,26 +202,21 @@ def get_embedding_based_recommendations(
             genres_list = [genres_val] if genres_val else []
         elif isinstance(genres_val, dict) and "Name" in genres_val:
             genres_list = [str(genres_val.get("Name"))] if genres_val.get("Name") else []
-        else:
-            genres_list = []
-        id_to_title[iid] = title
-        id_to_genres[iid] = genres_list
-
-    results: List[Dict[str, Any]] = []
-    for idx in top_indices:
-        iid = ids[idx]
-        results.append(
-            {
-                "Id": iid,
-                "Title": id_to_title.get(iid, ""),
-                "Genres": id_to_genres.get(iid, []),
-                "Score": float(sims[idx]),
-            }
-        )
+        
+        results.append({
+            "Id": iid,
+            "Title": title,
+            "Genres": genres_list,
+            "Score": float(sims[idx]),
+        })
+        
     return results
 
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
+    """
+    Kullanıcı bir seed belirtmezse, varsayılan bir tane seçer.
+    """
     for iid in embeddings.keys():
         return iid
     raise ValueError("No items available to pick a default seed.")
@@ -223,14 +231,18 @@ def main():
     args = parser.parse_args()
 
     catalog = load_catalog(args.data)
-    embeddings, id_to_item = generate_embeddings(catalog)
+    # : generate_embeddings fonksiyonuna data yolu parametresi eklendi.
+    embeddings, id_to_item = generate_embeddings(catalog, json_path=args.data)
 
     if not embeddings:
         raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
 
     seed_id = args.seed or pick_default_seed(embeddings)
 
-    recs = get_embedding_based_recommendations(seed_id=seed_id, catalog=catalog, embeddings=embeddings, k=args.k)
+    # : get_embedding_based_recommendations fonksiyonuna 'catalog' yerine 'id_to_item' veriliyor.
+    recs = get_embedding_based_recommendations(
+        seed_id=seed_id, id_to_item=id_to_item, embeddings=embeddings, k=args.k
+    )
 
     print(f"Seed Id: {seed_id}")
     print("Top recommendations:")
