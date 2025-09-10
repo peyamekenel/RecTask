@@ -274,16 +274,13 @@ def evaluate_recommender(
 
     for user, items in eligible.items():
         item_list = list(items)
-        if len(item_list) < 2:
+        present_list = [iid for iid in item_list if iid in embeddings]
+        if len(present_list) < 2:
             continue
 
-        seed_id = random.choice(item_list)
-        relevant = set(item_list)
-        if seed_id in relevant:
-            relevant.remove(seed_id)
-
-        if seed_id not in embeddings:
-            continue
+        seed_id = random.choice(present_list)
+        relevant = set(present_list)
+        relevant.discard(seed_id)
 
         recs = get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
         rec_ids = [r["Id"] for r in recs]
