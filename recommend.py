@@ -4,6 +4,7 @@ import os
 from typing import Dict, List, Any, Tuple
 import hashlib
 import math
+import random
 
 import numpy as np
 from numpy.typing import NDArray
@@ -264,10 +265,22 @@ def evaluate_recommender(
     recalls: List[float] = []
     ndcgs: List[float] = []
 
+    random.seed(42)
+
+    bucket_labels = ["2", "3", "4", "5"]
+    bucket_precisions: Dict[str, List[float]] = {b: [] for b in bucket_labels}
+    bucket_recalls: Dict[str, List[float]] = {b: [] for b in bucket_labels}
+    bucket_ndcgs: Dict[str, List[float]] = {b: [] for b in bucket_labels}
+
     for user, items in eligible.items():
-        sorted_items = sorted(items)
-        seed_id = sorted_items[0]
-        relevant = set(sorted_items[1:])
+        item_list = list(items)
+        if len(item_list) < 2:
+            continue
+
+        seed_id = random.choice(item_list)
+        relevant = set(item_list)
+        if seed_id in relevant:
+            relevant.remove(seed_id)
 
         if seed_id not in embeddings:
             continue
@@ -287,6 +300,13 @@ def evaluate_recommender(
         recalls.append(rec)
         ndcgs.append(ndcg)
 
+        n_items = len(item_list)
+        if 2 <= n_items <= 5:
+            b = str(n_items)
+            bucket_precisions[b].append(prec)
+            bucket_recalls[b].append(rec)
+            bucket_ndcgs[b].append(ndcg)
+
     if not precisions:
         print("No users with seed items present in catalog; evaluation skipped.")
         return
@@ -300,6 +320,13 @@ def evaluate_recommender(
     print(f"- Precision@{k}: {avg_p:.4f}")
     print(f"- Recall@{k}:    {avg_r:.4f}")
     print(f"- NDCG@{k}:      {avg_n:.4f}")
+    print("\nStratified evaluation by exact interaction count (2–5):")
+    for b in bucket_labels:
+        bp = float(np.mean(bucket_precisions[b])) if bucket_precisions[b] else float("nan")
+        br = float(np.mean(bucket_recalls[b])) if bucket_recalls[b] else float("nan")
+        bn = float(np.mean(bucket_ndcgs[b])) if bucket_ndcgs[b] else float("nan")
+        count_b = len(bucket_precisions[b])
+        print(f"- {b} items (users={count_b}): Precision@{k}={bp:.4f} | Recall@{k}={br:.4f} | NDCG@{k}={bn:.4f}")
 
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
