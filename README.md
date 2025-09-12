@@ -1,6 +1,6 @@
 # RecTask – Content-based Recommender with Sentence Embeddings
 
-This repository provides a simple content-based recommendation system using sentence embeddings from sentence-transformers/paraphrase-MPNet-base-v2.
+This repository provides a simple content-based recommendation system using sentence embeddings from sentence-transformers/all-MPNet-base-v2.
 
 Features:
 - Weighted embeddings from separate encodes of Title (0.3) and Genres (0.7), then per-item L2 normalization
@@ -26,7 +26,5 @@ python recommend.py --data "/path/to/all+1.json" --k 10
 Optional seed:
 python recommend.py --data "/path/to/all+1.json" --seed 317111 --k 10
 
-Notes:
-- If --seed is omitted, the first available item is used.
 - A cache file embeddings_cache.npz is created next to the script. Delete it to force full re-embed.
 - The cache automatically invalidates when Title/Genres, model name, or weights change.
