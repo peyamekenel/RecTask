@@ -3,12 +3,14 @@ import json
 import os
 from typing import Dict, List, Any, Tuple
 import hashlib
+import math
+import random  
 
 import numpy as np
 from numpy.typing import NDArray
 from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
 
-# sentence-transformers kütüphanesi opsiyonel olarak kontrol ediliyor
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError as e:
@@ -31,7 +33,7 @@ def load_catalog(json_path: str) -> List[Dict[str, Any]]:
 def generate_embeddings(
     catalog: List[Dict[str, Any]],
     json_path: str,  # Dinamik cache yolu için dosya yolu eklendi
-    model_name: str = "sentence-transformers/paraphrase-MPNet-base-v2",
+    model_name: str = "sentence-transformers/all-MPNet-base-v2",
 ) -> Tuple[Dict[str, NDArray[np.float32]], Dict[str, Dict[str, Any]]]:
     """
     Katalogdaki her bir öğe için metin embedding'leri oluşturur.
@@ -209,8 +211,97 @@ def get_embedding_based_recommendations(
             "Genres": genres_list,
             "Score": float(sims[idx]),
         })
-        
     return results
+
+def evaluate_recommender(
+    embeddings: Dict[str, NDArray[np.float32]],
+    id_to_item: Dict[str, Dict[str, Any]],
+    interactions_path: str,
+    k: int = 10,
+) -> None:
+    col_names = [
+        "profileid",
+        "contentid",
+        "contenttype",
+        "timestamp",
+        "episodecount",
+        "wathcedcount",
+        "applicationid",
+        "deviceid",
+        "lang",
+        "country",
+    ]
+    df = pd.read_csv(interactions_path, header=None, names=col_names)
+    df = df[["profileid", "contentid"]].dropna()
+    df["profileid"] = df["profileid"].astype(str)
+    df["contentid"] = df["contentid"].astype(str)
+
+    user_to_items: Dict[str, set] = {}
+    for uid, cid in zip(df["profileid"].values, df["contentid"].values):
+        s = user_to_items.get(uid)
+        if s is None:
+            s = set()
+            user_to_items[uid] = s
+        s.add(cid)
+
+    eligible = {u: items for u, items in user_to_items.items() if len(items) >= 5}
+    if not eligible:
+        print("No eligible users (>=5 interactions) found for evaluation.")
+        return
+
+    def dcg(rec_ids: List[str], relevant: set, k: int) -> float:
+        score = 0.0
+        for i, rid in enumerate(rec_ids[:k], start=1):
+            rel = 1.0 if rid in relevant else 0.0
+            if rel > 0:
+                score += rel / math.log2(i + 1)
+        return score
+
+    def idcg(num_relevant: int, k: int) -> float:
+        max_hits = min(k, num_relevant)
+        return sum(1.0 / math.log2(i + 1) for i in range(1, max_hits + 1))
+
+    precisions: List[float] = []
+    recalls: List[float] = []
+    ndcgs: List[float] = []
+
+    for user, items in eligible.items():
+
+        seed_id = random.choice(list(items))
+        # Geriye kalanlar ise 'doğru' kabul edilenler (relevant) setini oluşturur
+        relevant = items - {seed_id}
+
+        if seed_id not in embeddings:
+            continue
+
+        recs = get_embedding_based_recommendations(seed_id, id_to_item, embeddings, k=k)
+        rec_ids = [r["Id"] for r in recs]
+
+        hits = sum(1 for rid in rec_ids if rid in relevant)
+        prec = hits / float(k) if k > 0 else 0.0
+        rec = hits / float(len(relevant)) if len(relevant) > 0 else 0.0
+
+        dcg_val = dcg(rec_ids, relevant, k)
+        idcg_val = idcg(len(relevant), k)
+        ndcg = (dcg_val / idcg_val) if idcg_val > 0 else 0.0
+
+        precisions.append(prec)
+        recalls.append(rec)
+        ndcgs.append(ndcg)
+
+    if not precisions:
+        print("No users with seed items present in catalog; evaluation skipped.")
+        return
+
+    avg_p = float(np.mean(precisions))
+    avg_r = float(np.mean(recalls))
+    avg_n = float(np.mean(ndcgs))
+
+    print("Evaluation summary (averaged across users):")
+    print(f"- Users evaluated: {len(precisions)}")
+    print(f"- Precision@{k}: {avg_p:.4f}")
+    print(f"- Recall@{k}:    {avg_r:.4f}")
+    print(f"- NDCG@{k}:      {avg_n:.4f}")
 
 
 def pick_default_seed(embeddings: Dict[str, NDArray[np.float32]]) -> str:
@@ -228,18 +319,26 @@ def main():
     parser.add_argument("--seed", required=False, help="Seed item Id. If not provided, picks the first available.")
     parser.add_argument("--k", type=int, default=10, help="Number of recommendations to return.")
     parser.add_argument("--save", required=False, help="Optional path to save computed embeddings as .npz.")
+    parser.add_argument("--interactions", required=False, help="Path to interactions CSV (no header). When provided, run evaluation mode.")
     args = parser.parse_args()
 
     catalog = load_catalog(args.data)
-    # : generate_embeddings fonksiyonuna data yolu parametresi eklendi.
     embeddings, id_to_item = generate_embeddings(catalog, json_path=args.data)
 
     if not embeddings:
         raise RuntimeError("No embeddings were generated. Check that items have Title and/or Genres.")
 
+    if args.interactions:
+        evaluate_recommender(embeddings=embeddings, id_to_item=id_to_item, interactions_path=args.interactions, k=args.k)
+        if args.save:
+            ids = list(embeddings.keys())
+            mat = np.stack([embeddings[i] for i in ids], axis=0)
+            np.savez_compressed(args.save, ids=np.array(ids), embeddings=mat)
+            print(f"Saved embeddings to: {args.save}")
+        return
+
     seed_id = args.seed or pick_default_seed(embeddings)
 
-    # : get_embedding_based_recommendations fonksiyonuna 'catalog' yerine 'id_to_item' veriliyor.
     recs = get_embedding_based_recommendations(
         seed_id=seed_id, id_to_item=id_to_item, embeddings=embeddings, k=args.k
     )
